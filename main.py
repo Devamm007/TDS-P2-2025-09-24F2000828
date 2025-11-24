@@ -32,6 +32,12 @@ load_dotenv()
 app.state.SECRET = getenv("SECRET")
 app.state.LLM_API_KEY = getenv("LLM_API_KEY")
 
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    """Serve the index.html page"""
+    with open(templates_dir / "index.html") as f:
+        return HTMLResponse(content=f.read())
+
 def validate_secret(secret: str) -> bool:
     return secret == app.state.SECRET
 
