@@ -125,7 +125,7 @@ def handle_task(data: dict, background_tasks: BackgroundTasks):
         # validate email
         if not validate_email(data.get('email', '')):
             print("--- Invalid email detected. ---\n")
-            raise HTTPException(status_code=400, detail="Invalid email")  
+            raise HTTPException(status_code=400, detail="Invalid email")
 
         # start background task processing
         print("=== START EVALUATION ===\n")
@@ -175,13 +175,37 @@ def handle_task(data: dict, background_tasks: BackgroundTasks):
         
     ## for last interaction
     if data.get("correct") and not data.get("url"):
+        if not data.get('correct'):
+            last_question = questions_data[-1]
+            time_diff = datetime.now(IST) - last_question["started_at"]
+            if time_diff.total_seconds() > 120:
+                print(f"--- Time exceeded for {last_question['url']}. Ending evaluation. ---\n")
+            else:
+                print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
+                background_tasks.add_task(process_task, last_question["url"], data.get("reason"))
+        else:
+            print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
+            # change the status of last question to True
+            questions_data[-1]["status"] = True
+            questions_data[-1]["completed_at"] = datetime.now(IST)
+            questions_data.append({
+                "url": data.get('url', None),
+                "question_number": 1 + len(questions_data),
+                "status": False,
+                "started_at": datetime.now(IST),
+                "completed_at": None
+            })
+            # log all questions data in logging format
+            print(f"--- QUESTIONS SUMMARY ---")
+            for q in questions_data:
+                print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+
         print("=== END EVALUATION ===\n")
         return {"status": "Evaluation completed.",
                 "summary": questions_data,
                 "email": "24f2000828@ds.study.iitm.ac.in"}
     
     return {"status": "Secret validated. Task is being processed in the background."}
-
 
 
 
