@@ -1,23 +1,47 @@
-from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
+from playwright.async_api import async_playwright, Page
 import httpx
 import asyncio
-
 from dotenv import load_dotenv
 from os import getenv
 from pathlib import Path
-
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 import re
 import pytz
 from datetime import datetime
-
+from urllib.parse import urlparse, urljoin
+import json
+from typing import Any
 import uvicorn
 
 IST = pytz.timezone('Asia/Kolkata')
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+	app.state.playwright = await async_playwright().start()
+	app.state.browser = await app.state.playwright.chromium.launch(headless=True)
+	app.state.page = await app.state.browser.new_page()
+	print("--- Browser launched ---")
+	try:
+		yield
+	finally:
+		await app.state.page.close()
+		await app.state.browser.close()
+		await app.state.playwright.stop()
+		print("--- Browser closed ---")
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=["*"],
+	allow_credentials=True,
+	allow_methods=["*"],
+	allow_headers=["*"],
+)
 
 # Configuration
 templates_dir = Path(__file__).parent / "templates"
@@ -43,7 +67,6 @@ def validate_email(email: str) -> bool:
 
 def validate_url(url: str) -> bool:
     ''' validate url return True or string with error message '''
-    from urllib.parse import urlparse
     try:
         result = urlparse(url)
         if result.scheme != "https" or not result.netloc:
@@ -51,22 +74,131 @@ def validate_url(url: str) -> bool:
         return True
     except Exception:
         return "Invalid URL format"
+    
+def clean_json_text(raw: str) -> str:
+	"""Clean malformed JSON in <pre> blocks."""
+	# Remove HTML tags like <span class="origin">...</span>
+	raw = re.sub(r"<[^>]+>", "", raw)
 
-async def solve_with_llm(context: str, previous_reason: str = None) -> str:
+	# Replace invalid ellipsis (...) with null
+	raw = raw.replace("...", "null")
+
+	# Remove trailing commas before closing braces
+	raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+	return raw.strip()
+
+async def extract_everything(page: Page, url: str):
+	"""Load a quiz URL and extract all data for LLM."""
+    # load the page
+	await page.goto(url, wait_until="networkidle")
+    # extract full HTML
+	try:
+		html = await page.content()
+	except:
+		html = ""
+    # extract JSON payload templates
+	payload_templates = []
+	blocks = await page.query_selector_all("pre, code")
+
+	for block in blocks:
+		raw = (await block.inner_text()).strip()
+
+		# try raw JSON
+		try:
+			payload_templates.append(json.loads(raw))
+			continue
+		except:
+			pass
+
+		# clean JSON and retry
+		cleaned = clean_json_text(raw)
+		try:
+			payload_templates.append(json.loads(cleaned))
+		except:
+			pass
+
+    # extract anchor
+	hrefs = []
+	a_tags = await page.query_selector_all("a")
+
+	for a in a_tags:
+		href = await a.get_attribute("href")
+		if href:
+			hrefs.append(urljoin(page.url, href))
+
+	# extract linked pages
+	linked_pages = {}
+	for h in hrefs:
+		# only same domain links
+		if not h.startswith("http"):
+			continue
+		if page.url.split("//")[1].split("/")[0] not in h:
+			continue
+
+		# allow only relative links or same domain pages
+		try:
+			await page.goto(h, wait_until="networkidle")
+			l_html = await page.content()
+			l_text = await page.inner_text("body")
+
+			linked_pages[h] = {
+				"html": l_html,
+				"text": l_text
+			}
+		except:
+			pass
+
+	# restore original page (critical)
+	await page.goto(url, wait_until="networkidle")
+
+	# extract media links
+	pdfs, csvs, audios, images = [], [], [], []
+
+	for h in hrefs:
+		if h.endswith(".pdf"):
+			pdfs.append(h)
+		elif h.endswith(".csv"):
+			csvs.append(h)
+		elif any(h.endswith(ext) for ext in [".mp3", ".opus", ".wav"]):
+			audios.append(h)
+		elif any(h.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif"]):
+			images.append(h)
+
+	# extract audio from <audio> tags
+	audio_tags = await page.query_selector_all("audio")
+	for audio in audio_tags:
+		src = await audio.get_attribute("src")
+		if src:
+			audios.append(urljoin(page.url, src))
+
+	return {
+		"html": html,
+		"payload_templates": payload_templates,
+		"pdf_links": pdfs,
+		"csv_links": csvs,
+		"audio_links": audios,
+		"image_links": images,
+		"linked_pages": linked_pages,
+	}
+
+async def solve_with_llm(extracted_content: dict[Any], previous_reason: str = None) -> str:
     """
     Sends scraped content to LLM to extract the question and find the answer.
     """
     system_prompt = (
-        "You are an automated agent solving a Capture The Flag (CTF) quiz. "
-        "Your goal is to extract the question from the provided webpage content "
+        "You are an automated agent solving a quiz as a human. "
+        "Your goal is to understand the question from the provided structured content "
         "and provide the specific answer. "
         "Return ONLY the answer. If it is a number, return just the digits. "
+        "Do not provide email, secret, url, ignore them, provide only the answer field. "
+        "If it is a number, return just the number. "
         "If it is a word, return just the word. "
         "If it is a phrase, return just the phrase without any quotes. "
-        "If it is data, return JSON format with keys and values (values maybe data URI/attachment)."
+        "If it is data, return JSON format with keys and values (values maybe data URI/attachment needed for 'answer'')."
     )
-    
-    user_prompt = f"Webpage Content:\n{context}\n"
+    # pass dict as string
+    user_prompt = f"Structured Content:\n{json.dumps(extracted_content, indent=2)}\n"
     
     if previous_reason:
         user_prompt += f"\n\nPREVIOUS ATTEMPT FAILED. Reason: {previous_reason}. Try a different approach."
@@ -100,7 +232,7 @@ async def solve_with_llm(context: str, previous_reason: str = None) -> str:
         return answer
     except Exception as e:
         print(f"--- LLM Error: {e} ---")
-        return "0" # Fallback
+        return None
 
 async def process_task(url: str, reason: str = None) -> dict:
     """
@@ -119,28 +251,19 @@ async def process_task(url: str, reason: str = None) -> dict:
 
     print(f"--- [{datetime.now(IST)}] Scraping: {url} ---")
 
-    scraped_content = ""
-    try:
-        browser_config = BrowserConfig(verbose=False, headless=True)
-        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
-        
-        async with AsyncWebCrawler(config=browser_config) as crawler:
-            result = await crawler.arun(url=url, config=run_config)
-            
-            if result.success:
-                # We prefer Markdown for LLMs, but fallback to cleaned HTML
-                scraped_content = result.markdown or result.cleaned_html
-                print(f"--- Scraped {len(scraped_content)} chars. ---")
-            else:
-                print(f"--- Scraping failed: {result.error_message} ---")
-                return None
-    except Exception as e:
-        print(f"--- Crawler Exception: {e} ---")
+    # 1. Scrape
+    scraped_content = await extract_everything(app.state.page, url)
+    if not scraped_content:
+        print(f"--- Failed to scrape content from {url} ---")
         return None
 
-    # 2. Solve
+    # 2. Extract data from assets to text
+    # Extract text from scraped_content links
+    text_content = {}
+
+    # 3. Solve with LLM
     print(f"--- Analyzing with LLM... ---")
-    answer = await solve_with_llm(scraped_content, reason)
+    answer = await solve_with_llm(text_content, reason)
     print(f"--- Calculated Answer: {answer} ---")
 
     return {
@@ -305,8 +428,6 @@ async def handle_task(data: dict):
             print(f"--- URL validation failed: {url_validation_result} ---\n")
             raise HTTPException(status_code=400, detail=url_validation_result)
         
-        print(f"--- Processing URL {data.get('url')} ---\n")
-
         asyncio.create_task(worker(data.get("url")))
     else:
         print("--- Invalid JSON structure detected. ---\n")

@@ -3,5 +3,5 @@ python-dotenv
 uvicorn[standard]
 asyncio
 httpx
-crawl4ai
 pytz
+playwright
