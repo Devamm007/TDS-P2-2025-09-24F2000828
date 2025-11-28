@@ -1,26 +1,20 @@
-# /// script
-# requires python3 = ">=3.11"
-# requirements = [
-#     "fastapi>=0.95.2",
-#     "uvicorn>=0.22.0",
-#     "PyMuPDF>=1.22.5"
-# ]
-# ///
-
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from urllib.parse import urlparse
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-import requests
+import httpx
+import asyncio
 
 from dotenv import load_dotenv
 from os import getenv
 from pathlib import Path
 
-import base64
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 import re
-from time import sleep
 import pytz
 from datetime import datetime
+
+import uvicorn
 
 IST = pytz.timezone('Asia/Kolkata')
 app = FastAPI()
@@ -31,6 +25,9 @@ app.mount("/templates", StaticFiles(directory=str(templates_dir)), name="templat
 load_dotenv()
 app.state.SECRET = getenv("SECRET")
 app.state.LLM_API_KEY = getenv("LLM_API_KEY")
+app.state.EMAIL = getenv("EMAIL")
+app.state.LLM_BASE_URL = getenv("LLM_BASE_URL")
+app.state.LLM_MODEL = getenv("LLM_MODEL")
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -42,81 +39,256 @@ def validate_secret(secret: str) -> bool:
     return secret == app.state.SECRET
 
 def validate_email(email: str) -> bool:
-    return email == "24f2000828@ds.study.iitm.ac.in"
+    return email == app.state.EMAIL
 
-def validate_url(url: str) -> bool: 
-    ''' validate url reutrn True or string with error message '''
-    # Basic URL validation
-    url_regex = re.compile(
-        r'^(?:http|ftp)s?://' # http:// or https://
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' # domain...
-        r'localhost|' # localhost...
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|' # ...or ipv4
-        r'\[?[A-F0-9]*:[A-F0-9:]+\]?)' # ...or ipv6
-        r'(?::\d+)?' # optional port
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+def validate_url(url: str) -> bool:
+    ''' validate url return True or string with error message '''
+    from urllib.parse import urlparse
+    try:
+        result = urlparse(url)
+        if result.scheme != "https" or not result.netloc:
+            return "Invalid URL format"
+        return True
+    except Exception:
+        return "Invalid URL format"
+
+async def solve_with_llm(context: str, previous_reason: str = None) -> str:
+    """
+    Sends scraped content to LLM to extract the question and find the answer.
+    """
+    system_prompt = (
+        "You are an automated agent solving a Capture The Flag (CTF) quiz. "
+        "Your goal is to extract the question from the provided webpage content "
+        "and provide the specific answer. "
+        "Return ONLY the answer. If it is a number, return just the digits. "
+        "If it is a word, return just the word. "
+        "If it is a phrase, return just the phrase without any quotes. "
+        "If it is data, return JSON format with keys and values (values maybe data URI/attachment)."
+    )
     
-    if re.match(url_regex, url) is None:
-        return f"Invalid URL format: {url}"
+    user_prompt = f"Webpage Content:\n{context}\n"
+    
+    if previous_reason:
+        user_prompt += f"\n\nPREVIOUS ATTEMPT FAILED. Reason: {previous_reason}. Try a different approach."
 
-    # Check URL reachability
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=5)
-        if response.status_code != 200:
-            return f"URL is not reachable, status code: {response.status_code}"
-    except requests.RequestException as e:
-        return f"URL is not reachable: {url}\nException: ({str(e)})"
-    return True
+    payload = {
+        "model": app.state.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.1
+    }
 
-def process_task(url: str, reason: str = None) -> ...:
-    '''Keep checking for incoming JSON body to API endpoint
-    and run below while JSON body keeps coming with a URL'''
+    headers = {
+        "Authorization": f"Bearer {app.state.LLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
     try:
-        pass
+        async with httpx.AsyncClient(timeout=150) as client:
+            response = await client.post(
+                f"{app.state.LLM_BASE_URL}/chat/completions", 
+                json=payload, 
+                headers=headers,
+                timeout=150
+            )
+        response.raise_for_status()
+        result = response.json()
+        answer = result['choices'][0]['message']['content'].strip()
+        answer = answer.replace("`", "").replace("'", "").replace('"', "")
+        return answer
     except Exception as e:
-        print(f"--- ERROR ---\nTYPE: {type(e)}\nDETAILS: {str(e)}\n--- END ERROR ---\n")
-           
-    return ...
+        print(f"--- LLM Error: {e} ---")
+        return "0" # Fallback
 
-# INPUT (REPEATED INTERACTIONS):
-# {
-#   "email": "your email", // Student email ID
-#   "secret": "your secret", // Student-provided secret
-#   "url": "https://example.com/quiz-834" // A unique task URL
-#   // ... other fields
-# }
+async def process_task(url: str, reason: str = None) -> dict:
+    """
+    1. Scrape the data from URL or nested URLs
+    2. Extract relevant content from various file types
+    (Usually headless browser + file parsers)
+    (html, script, css files of url and nested urls,
+    audio(.mp3, .wav, .flac, .aac, .ogg, .m4a, .alac, and .wma),
+    image(.jpg, .jpeg, .png, .gif, .webp, .svg, .avif),
+    video(.mkv, .mp4, .mov, .avi, .wmv, .flv, .webm, .mpeg),
+    csv, xlxs, docx, text, pdf(text, ocr, tables), zip files, tar files etc.)
+    3. Understand the question/task
+    4. Process it
+    5. Return the answer
+    """
 
-# OUTPUT (FOR EACH INTERACTION):
-# {
-#   "email": "your email",
-#   "secret": "your secret",
-#   "url": "https://example.com/quiz-834",
-#   "answer": 12345 // the correct answer
-# }
+    print(f"--- [{datetime.now(IST)}] Scraping: {url} ---")
 
-# RESULT OF INTERACTION:
-# {
-#   "correct": true,
-#   "url": "https://example.com/quiz-942",
-#   "reason": null
-#   // ... other fields
-# }
+    scraped_content = ""
+    try:
+        browser_config = BrowserConfig(verbose=False, headless=True)
+        run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+        
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await crawler.arun(url=url, config=run_config)
+            
+            if result.success:
+                # We prefer Markdown for LLMs, but fallback to cleaned HTML
+                scraped_content = result.markdown or result.cleaned_html
+                print(f"--- Scraped {len(scraped_content)} chars. ---")
+            else:
+                print(f"--- Scraping failed: {result.error_message} ---")
+                return None
+    except Exception as e:
+        print(f"--- Crawler Exception: {e} ---")
+        return None
 
-# FORMAT FOR LAST INTERACTION (WHEN NO FURTHER QUESTIONS):
-# {
-#   "correct": false,
-#   "reason": "The sum you provided is incorrect."
-#   // maybe with no new url provided
-# }
+    # 2. Solve
+    print(f"--- Analyzing with LLM... ---")
+    answer = await solve_with_llm(scraped_content, reason)
+    print(f"--- Calculated Answer: {answer} ---")
 
-# Storing questions url, answer, status
-questions_data = []
+    return {
+            "email": app.state.EMAIL,
+            "secret": app.state.SECRET,
+            "url": url,
+            "answer": answer
+        }
+
+async def worker(url: str):
+    """
+    Worker function to handle the task processing and submission loop.
+    """
+
+    max_iterations = 400
+    iteration_count = 0
+    questions_data = []
+    questions_data.append({
+        "url": url,
+        "question_number": 1 + len(questions_data),
+        "status": False,
+        "started_at": datetime.now(IST),
+        "completed_at": None,
+        "answer": None
+    })
+    print("=== START EVALUATION ===\n")
+    domain_match = re.search(r'^(?:http|ftp)s?://([^/]+)', url)
+    domain = domain_match.group(1) if domain_match else 'default'
+
+    # initial processing
+    payload = await process_task(url)
+    while True:
+        # subsequent processing based on response  
+        if not payload:
+            print(f"--- Failed to generate payload for submission. Ending evaluation. ---\n")
+            print("=== END EVALUATION DUE TO PAYLOAD ERROR ===\n")
+            return None        
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(f"https://{domain}/submit", json=payload)
+        except Exception as e:
+            print(f"--- NETWORK ERROR ---\nTYPE: {type(e)}\nDETAILS: {str(e)}\n--- END NETWORK ERROR ---\n")
+            print(f"=== END EVALUATION DUE TO NETWORK ERROR ===")
+            return None
+        # error, server error status codes handling
+        if response.status_code in [400, 403, 404, 500, 502, 503, 504]:
+            print(f"--- ERROR ---\nTYPE: HTTP {response.status_code}\nDETAILS: {response.text}\n--- END ERROR ---\n")
+            print(f"=== END EVALUATION DUE TO ERROR ===")
+            return None
+        
+        # handle is response not json convertable
+        try:
+            response.json()
+        except Exception as e:
+            print(f"--- ERROR ---\nTYPE: Invalid JSON Response\nDETAILS: {response.text}\n--- END ERROR ---\n")
+            print(f"=== END EVALUATION DUE TO INVALID JSON RESPONSE ===")
+            return None
+        data = response.json()
+        last_question = questions_data[-1]
+        questions_data[-1]["answer"] = payload.get("answer", None)
+
+        print(f"--- Answer submitted successfully to {domain}/submit ---\n")
+        print(f"--- Submission Response ---\n{response.json()}\n--- End Submission Response ---\n")
+
+        if data.get("correct") and data.get("url"):
+            if data.get("correct") is True:
+                print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
+                # change the status of last question to True
+                questions_data[-1]["status"] = True
+                questions_data[-1]["completed_at"] = datetime.now(IST)
+                questions_data.append({
+                    "url": data.get('url', None),
+                    "question_number": 1 + len(questions_data),
+                    "status": False,
+                    "started_at": datetime.now(IST),
+                    "completed_at": None,
+                    "answer": None
+                })
+                payload = await process_task(data.get("url"))
+            else:
+                last_question = questions_data[-1]
+                time_diff = datetime.now(IST) - last_question["started_at"]
+                if time_diff.total_seconds() > 60:
+                    print(f"--- Time exceeded for {last_question['url']}. Proceeding to next URL: {data.get('url')} ---\n")
+                    questions_data[-1]["status"] = False
+                    questions_data[-1]["completed_at"] = datetime.now(IST)
+                    questions_data.append({
+                        "url": data.get('url', None),
+                        "question_number": 1 + len(questions_data),
+                        "status": False,
+                        "started_at": datetime.now(IST),
+                        "completed_at": None,
+                        "answer": None
+                    })
+                    payload = await process_task(data.get("url"))
+                else:
+                    if data.get("reason"):
+                        print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
+                    payload = await process_task(last_question["url"], data.get("reason"))
+        elif data.get("correct") and not data.get("url"):
+            if data.get('correct') is False:
+                last_question = questions_data[-1]
+                time_diff = datetime.now(IST) - last_question["started_at"]
+                if time_diff.total_seconds() > 150:
+                    print(f"--- Time exceeded for {last_question['url']}. Ending evaluation. ---\n")
+                    questions_data[-1]["status"] = False
+                    questions_data[-1]["completed_at"] = datetime.now(IST)
+                    print(f"--- QUESTIONS SUMMARY ---")
+                    for q in questions_data:
+                        print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+                    print("=== END EVALUATION ===\n")
+                    break
+                else:
+                    print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
+                    questions_data[-1]["status"] = False
+                    payload = await process_task(last_question["url"], data.get("reason"))
+            else:
+                print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
+                # change the status of last question to True
+                questions_data[-1]["status"] = True
+                questions_data[-1]["completed_at"] = datetime.now(IST)
+                # log all questions data in logging format
+                print(f"--- QUESTIONS SUMMARY ---")
+                for q in questions_data:
+                    print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+                print("=== END EVALUATION ===\n")
+                break
+            
+        iteration_count += 1
+        await asyncio.sleep(1)  # brief pause to avoid overwhelming the server
+        if iteration_count >= max_iterations:
+            print(f"--- QUESTIONS SUMMARY ---")
+            for q in questions_data:
+                print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+            print(f"--- Maximum iterations reached. Ending evaluation. ---\n")
+            print("=== END EVALUATION ===\n")
+            break
+    return None            
 
 @app.post("/handle_task")
-def handle_task(data: dict, background_tasks: BackgroundTasks):
-    # validate email and secret if in JSON body
-    ## for first interaction
-    if data.get('secret') and data.get('email'):
+async def handle_task(data: dict):
+    """
+    Endpoint to handle incoming tasks for processing.
+    Validates the input and initiates background processing.
+    """
+
+    # validate secret, email and JSON validity
+    if data.get('secret') and data.get('email') and data.get('url'):
         # validate secret
         if not validate_secret(data.get('secret', '')):
             print("--- Invalid secret detected. ---\n")
@@ -126,212 +298,21 @@ def handle_task(data: dict, background_tasks: BackgroundTasks):
         if not validate_email(data.get('email', '')):
             print("--- Invalid email detected. ---\n")
             raise HTTPException(status_code=400, detail="Invalid email")
-
-        # start background task processing
-        print("=== START EVALUATION ===\n")
-        questions_data.append({
-            "url": data.get('url', None),
-            "question_number": 1 + len(questions_data),
-            "status": False,
-            "started_at": datetime.now(IST),
-            "completed_at": None
-        })
-
-    ## for subsequent interactions
-    if data.get("correct") and data.get("url"):
-        if data.get("correct"):
-            print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
-            # change the status of last question to True
-            questions_data[-1]["status"] = True
-            questions_data[-1]["completed_at"] = datetime.now(IST)
-            questions_data.append({
-                "url": data.get('url', None),
-                "question_number": 1 + len(questions_data),
-                "status": False,
-                "started_at": datetime.now(IST),
-                "completed_at": None
-            })
-            background_tasks.add_task(process_task, data.get("url"))
-        else:
-            last_question = questions_data[-1]
-            time_diff = datetime.now(IST) - last_question["started_at"]
-            if time_diff.total_seconds() > 60:
-                print(f"--- Time exceeded for {last_question['url']}. Proceeding to next URL: {data.get('url')} ---\n")
-                background_tasks.add_task(process_task, data.get("url"))
-            else:
-                if data.get("reason"):
-                    print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
-                background_tasks.add_task(process_task, last_question["url"], data.get("reason"))            
-                
-    ## for first interaction
-    if data.get("url") and not data.get("correct"):
+        
+        # validate url
         url_validation_result = validate_url(data.get("url", ""))
         if type(url_validation_result) != bool:
             print(f"--- URL validation failed: {url_validation_result} ---\n")
             raise HTTPException(status_code=400, detail=url_validation_result)
         
         print(f"--- Processing URL {data.get('url')} ---\n")
-        background_tasks.add_task(process_task, data.get("url"))
-        
-    ## for last interaction
-    if data.get("correct") and not data.get("url"):
-        if not data.get('correct'):
-            last_question = questions_data[-1]
-            time_diff = datetime.now(IST) - last_question["started_at"]
-            if time_diff.total_seconds() > 120:
-                print(f"--- Time exceeded for {last_question['url']}. Ending evaluation. ---\n")
-            else:
-                print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
-                background_tasks.add_task(process_task, last_question["url"], data.get("reason"))
-        else:
-            print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
-            # change the status of last question to True
-            questions_data[-1]["status"] = True
-            questions_data[-1]["completed_at"] = datetime.now(IST)
-            questions_data.append({
-                "url": data.get('url', None),
-                "question_number": 1 + len(questions_data),
-                "status": False,
-                "started_at": datetime.now(IST),
-                "completed_at": None
-            })
-            # log all questions data in logging format
-            print(f"--- QUESTIONS SUMMARY ---")
-            for q in questions_data:
-                print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
 
-        print("=== END EVALUATION ===\n")
-        return {"status": "Evaluation completed.",
-                "summary": questions_data,
-                "email": "24f2000828@ds.study.iitm.ac.in"}
-    
+        asyncio.create_task(worker(data.get("url")))
+    else:
+        print("--- Invalid JSON structure detected. ---\n")
+        raise HTTPException(status_code=400, detail="Invalid JSON structure")
+
     return {"status": "Secret validated. Task is being processed in the background."}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# def llm_process(data: dict) -> list[dict]:
-#     """
-#     Process task data through LLM API to generate code files.
-#     Returns list of dicts with name and content for each file.
-#     """
-#     headers = {
-#         "Authorization": f"Bearer {app.state.LLM_API_KEY}",
-#         "Content-Type": "application/json"
-#     }
-
-#     current_round = data.get('round', 1)
-
-#     # System Instruction: Focused and strict
-#     if current_round == 1:
-#         system_instruction = (
-#             "You are a strict, highly efficient code generation tool. "
-#             "Generate ONLY the requested files. "
-#             "DO NOT add any conversational text, explanations, or additional markdown outside the required file format. "
-#             "Use the specified file format: <<FILENAME.ext>>[newline]<content>[newline]<<END_FILE>>"
-#         )
-#     else: # For Round 2 and beyond
-#         # This instruction incorporates the allowance for new files
-#         system_instruction = (
-#             "You are a strict, highly efficient code refactoring and feature implementation tool. "
-#             "Your task is to **UPDATE** the existing project files provided in the context to implement the new brief and pass all checks. "
-#             "**PRIORITIZE UPDATING EXISTING FILES.** "
-#             "**ONLY OUTPUT FILES THAT NEED MODIFICATION OR ARE NEWLY CREATED.** Do not output unchanged files. "
-#             "DO NOT add any conversational text, explanations, or additional markdown outside the required file format. "
-#             "Use the specified file format: <<FILENAME.ext>>[newline]<content>[newline]<<END_FILE>>"
-#         )
-
-#     if current_round == 1:
-#         # User Prompt for Round 1 (Initial Generation)
-#         prompt_goal = "Generate a complete, high-quality web app. Ensure all files work together seamlessly."
-#     else:
-#         # User Prompt for Round 2 (Update/Refactoring)
-#         prompt_goal = (
-#             f"UPDATE the existing web app (provided in the 'EXISTING CODE CONTEXT' below) to implement the new brief for Round 2. ONLY output the complete, updated content for files that require changes. You may generate **NEW FILES** if they are necessary to complete the task."
-#         )
-
-#     # User Prompt: Highly compressed
-#     prompt = f"""
-#     Task: {data.get('task')}
-#     Brief: {data.get('brief')}
-#     Round: {current_round}
-#     Goal: {prompt_goal}
-#     Checks: {data.get('checks')}
-#     Files required: README.md (must include usage guide, cloning guide, inform License is MIT along with a message of being open to collaboration) , plus necessary HTML, CSS, JS.
-#     """
-    
-#     # Attachments: Included as a dedicated, compressed block
-#     attachments = data.get('attachments', [])
-#     if attachments:
-#         prompt += "\n--- ATTACHMENTS (File Name: URI) ---\n"
-#         for attachment in attachments:
-#             prompt += f"{attachment.get('name', 'N/A')}: {attachment.get('url', 'N/A')}\n"
-#         prompt += "--- END ATTACHMENTS ---\n"
-
-#     existing_code = data.get('existing_code_context')
-#     if existing_code:
-#         prompt += f"\n{existing_code}\n"
-#         prompt += "Carefully review the existing code above. Your generated files in the output MUST be complete and correctly integrated with this existing code to implement the requested brief.\n"
-    
-#     # Output Instruction: Strict format definition (Critical for robustness)
-#     prompt += """
-    
-#     Output all generated files using this format ONLY, starting immediately after this instruction:
-    
-#     <<FILENAME.ext>>
-#     // File content goes here
-#     <<END_FILE>>
-
-#     Ensure no additional text, explanations, or markdown outside this format.
-#     """
-
-#     # API request payload
-#     payload = {
-#         "model": "openai/gpt-4.1-nano",
-#         "messages": [
-#             {
-#                 "role": "system",
-#                 "content": system_instruction
-#             },
-#             {
-#                 "role": "user", 
-#                 "content": prompt
-#             }
-#         ],
-#         "temperature": 0.2
-#     }
-
-#     try:
-#         response = requests.post(
-#             "https://aipipe.org/openrouter/v1/chat/completions",
-#             headers=headers,
-#             json=payload
-#         )
-
-#         if response.status_code != 200:
-#             raise Exception(f"LLM API error: {response.status_code}, {response.text}")
-
-#         # Parse LLM response and extract code files
-#         content = response.json()["choices"][0]["message"]["content"]
-#         files = extract_files_from_response(content)
-#         print(f"LLM generated files successfully")
-#         return files
-
-#     except Exception as e:
-#         print(f"Error in LLM processing: {str(e)}")
-#         return []
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)

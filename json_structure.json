@@ -1,0 +1,22 @@
+{
+    "INPUT": {
+    "email": "your email",
+    "secret": "your secret",
+    "url": "https://example.com/quiz-834"
+    },
+    "OUTPUT": {
+    "email": "your email",
+    "secret": "your secret",
+    "url": "https://example.com/quiz-834",
+    "answer": 12345
+    },
+    "RESULT": {
+    "correct": true,
+    "url": "https://example.com/quiz-942",
+    "reason": null
+    },
+    "LAST_RESULT": {
+    "correct": false,
+    "reason": "The sum you provided is incorrect."
+    }
+}
