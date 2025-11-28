@@ -24,6 +24,7 @@ import pandas as pd
 import zipfile
 import tarfile
 import gzip
+import base64
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -120,9 +121,12 @@ async def extract_everything(page: Page, url: str):
         "model": "gemini-2.0-flash",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user",
+             "content": [
+                 {"type": "text", "text": user_prompt},
+                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(page_screenshot).decode()}"}}
+             ]}
         ],
-        "file": BytesIO(page_screenshot).getvalue(),
         "temperature": 0.1
     }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -237,9 +241,12 @@ async def extract_everything(page: Page, url: str):
                     "model": "gpt-4o-transcribe",
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
+                        {"role": "user",
+                         "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "audio_url", "audio_url": {"url": f"data:audio/{h.split('.')[-1]};base64," + base64.b64encode(audio_bytes.getvalue()).decode()}}
+                         ]}
                     ],
-                    "file": audio_bytes.getvalue(),
                     "temperature": 0.1
                 }
                 async with httpx.AsyncClient(timeout=30) as client:
@@ -276,9 +283,12 @@ async def extract_everything(page: Page, url: str):
                     "model": "gemini-2.0-flash",
                     "messages": [
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
+                        {"role": "user",
+                         "content": [
+                            {"type": "text", "text": user_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/{h.split('.')[-1]};base64," + base64.b64encode(image_bytes.getvalue()).decode()}}
+                         ]},
                     ],
-                    "file": image_bytes.getvalue(),
                     "temperature": 0.1
                 }
                 async with httpx.AsyncClient(timeout=30) as client:
@@ -488,14 +498,9 @@ async def process_task(url: str, reason: str = None) -> dict:
         print(f"--- Failed to scrape content from {url} ---")
         return None
 
-    # 2. Extract data from assets to text
-    for key, content in scraped_content.items():
-        print(f"--- Extracted {key}: {type(content)} ---")
-    text_content = {}
-
-    # 3. Solve with LLM
+    # 2. Solve with LLM
     print(f"--- Analyzing with LLM... ---")
-    answer = await solve_with_llm(text_content, reason)
+    answer = await solve_with_llm(scraped_content, reason)
     print(f"--- Calculated Answer: {answer} ---")
 
     return {
