@@ -16,6 +16,14 @@ from urllib.parse import urlparse, urljoin
 import json
 from typing import Any
 import uvicorn
+from io import BytesIO
+import pdfplumber
+from docx import Document
+from pptx import Presentation
+import pandas as pd
+import zipfile
+import tarfile
+import gzip
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -75,6 +83,12 @@ def validate_url(url: str) -> bool:
     except Exception:
         return "Invalid URL format"
     
+def llm_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {app.state.LLM_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
 def clean_json_text(raw: str) -> str:
 	"""Clean malformed JSON in <pre> blocks."""
 	# Remove HTML tags like <span class="origin">...</span>
@@ -89,100 +103,322 @@ def clean_json_text(raw: str) -> str:
 	return raw.strip()
 
 async def extract_everything(page: Page, url: str):
-	"""Load a quiz URL and extract all data for LLM."""
+    """Load a quiz URL and extract all data for LLM."""
     # load the page
-	await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="networkidle")
     # extract full HTML
-	try:
-		html = await page.content()
-	except:
-		html = ""
-    # extract JSON payload templates
-	payload_templates = []
-	blocks = await page.query_selector_all("pre, code")
+    html = await page.content()
+    print(f"--- Extracted HTML content from {url} ---")
 
-	for block in blocks:
-		raw = (await block.inner_text()).strip()
+    page_screenshot = await page.screenshot()
+    print(f"--- Captured screenshot of {url} ---")
+    # extract text from screenshot using llm_api_key and gemini-2.0-flash
+    # send to llm for image description
+    system_prompt = "You are an automated image description agent. Describe the content of the provided image accurately."
+    user_prompt = "Describe and extract content of the following image."
+    payload = {
+        "model": "gemini-2.0-flash",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        "file": BytesIO(page_screenshot).getvalue(),
+        "temperature": 0.1
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{app.state.LLM_BASE_URL}/chat/completions", 
+            json=payload, 
+            headers=llm_headers(),
+            timeout=30
+        )
+        response.raise_for_status()
+    result = response.json()
+    screenshot_description = result['choices'][0]['message']['content'].strip()
+    print(f"--- Extracted Screenshot Description from {url} ---")
 
-		# try raw JSON
-		try:
-			payload_templates.append(json.loads(raw))
-			continue
-		except:
-			pass
+    # extract pre, code blocks as JSON payload templates
+    precode = []
+    blocks = await page.query_selector_all("pre, code")
 
-		# clean JSON and retry
-		cleaned = clean_json_text(raw)
-		try:
-			payload_templates.append(json.loads(cleaned))
-		except:
-			pass
+    for block in blocks:
+        raw = (await block.inner_text()).strip()
 
-    # extract anchor
-	hrefs = []
-	a_tags = await page.query_selector_all("a")
+        # try raw JSON
+        try:
+            precode.append(json.loads(raw))
+            continue
+        except:
+            pass
 
-	for a in a_tags:
-		href = await a.get_attribute("href")
-		if href:
-			hrefs.append(urljoin(page.url, href))
+        # clean JSON and retry
+        cleaned = clean_json_text(raw)
+        try:
+            precode.append(json.loads(cleaned))
+        except:
+            pass
+    print(f"--- Extracted {len(precode)} pre/code blocks from {url} ---")
 
-	# extract linked pages
-	linked_pages = {}
-	for h in hrefs:
-		# only same domain links
-		if not h.startswith("http"):
-			continue
-		if page.url.split("//")[1].split("/")[0] not in h:
-			continue
+    # url extract, remove query params and fragments
+    parsed_url = urlparse(page.url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
 
-		# allow only relative links or same domain pages
-		try:
-			await page.goto(h, wait_until="networkidle")
-			l_html = await page.content()
-			l_text = await page.inner_text("body")
+    # extract scr, href, links from page
+    links = []
+    a_tags = await page.query_selector_all("a")
+    audio_tags = await page.query_selector_all("audio")
+    img_tags = await page.query_selector_all("img")
+    video_tags = await page.query_selector_all("video")
+    script_tags = await page.query_selector_all("script")
+    link_tags = await page.query_selector_all("link")
+    for a in a_tags:
+        href = await a.get_attribute("href")
+        if href:
+            links.append(urljoin(base_url, href))
+    for audio in audio_tags:
+        src = await audio.get_attribute("src")
+        if src:
+            links.append(urljoin(base_url, src))
+    for img in img_tags:
+        src = await img.get_attribute("src")
+        if src:
+            links.append(urljoin(base_url, src))
+    for video in video_tags:
+        src = await video.get_attribute("src")
+        if src:
+            links.append(urljoin(base_url, src))
+    for script in script_tags:
+        src = await script.get_attribute("src")
+        if src:
+            links.append(urljoin(base_url, src))
+    for link in link_tags:
+        href = await link.get_attribute("href")
+        if href:
+            links.append(urljoin(base_url, href))
+    print(f"--- Extracted {len(links)} links from {url} ---")
 
-			linked_pages[h] = {
-				"html": l_html,
-				"text": l_text
-			}
-		except:
-			pass
+    # populate liks to appropriate categories using extensions
+    pdfs, audios, images, linked_pages, others = [], [], [], {}, []
+    for h in links:
+        if h.endswith(".pdf"):
+            # use pdfplumber to extract text, tables from pdf using link
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(h)
+                response.raise_for_status()
+                with pdfplumber.open(BytesIO(response.content)) as pdf:
+                    text = ""
+                    tables = {}
+                    for i, page in enumerate(pdf.pages, start=1):
+                        text += f"Page {i}" + page.extract_text() + "\n"
+                        for table in page.extract_tables():
+                            tables[f"Page_{i}_Table_{len(tables)+1}"] = table
+                pdfs.append({
+                    "url": h,
+                    "text": text.strip(),
+                    "tables": tables
+                })
+                print(f"--- Extracted PDF content from {h} ---")
+            except Exception as e:
+                print(f"--- PDF Extraction Error for {h}: {e} ---")
+            
+        elif any(h.lower().endswith(ext) for ext in [".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".alac", ".wma"]):
+            # use llm_api_key to extract audio transcription from link using gpt-4o-transcribe
+            # use link to load audio file and convert to bytes using BytesIO
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(h)
+                response.raise_for_status()
+                audio_bytes = BytesIO(response.content)
+                # send to llm for transcription
+                system_prompt = "You are an automated transcription agent. Transcribe the provided audio file into text accurately."
+                user_prompt = "Transcribe the following audio file into text."
+                payload = {
+                    "model": "gpt-4o-transcribe",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "file": audio_bytes.getvalue(),
+                    "temperature": 0.1
+                }
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        f"{app.state.LLM_BASE_URL}/chat/completions", 
+                        json=payload, 
+                        headers=llm_headers(),
+                        timeout=30
+                    )
+                response.raise_for_status()
+                result = response.json()
+                transcription = result['choices'][0]['message']['content'].strip()
+                print(f"--- Extracted Audio Transcription from {h} ---")
+                audios.append({
+                    "url": h,
+                    "transcription": transcription
+                })
+            except Exception as e:
+                print(f"--- Audio Transcription Error for {h}: {e} ---")
+                transcription = "N/A"
+            
+        elif any(h.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif"]):
+            # use llm_api_key to extract image description from link using gemini-2.0-flash
+            # use link to load image file and convert to bytes using BytesIO
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(h)
+                response.raise_for_status()
+                image_bytes = BytesIO(response.content)
+                # send to llm for image description
+                system_prompt = "You are an automated image description agent. Describe the content of the provided image accurately."
+                user_prompt = "Describe and extract content of the following image."
+                payload = {
+                    "model": "gemini-2.0-flash",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "file": image_bytes.getvalue(),
+                    "temperature": 0.1
+                }
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        f"{app.state.LLM_BASE_URL}/chat/completions", 
+                        json=payload, 
+                        headers=llm_headers(),
+                        timeout=30
+                    )
+                response.raise_for_status()
+                result = response.json()
+                description = result['choices'][0]['message']['content'].strip()
+                print(f"--- Extracted Image Description from {h} ---")
+                images.append({
+                    "url": h,
+                    "description": description
+                })
+            except Exception as e:
+                print(f"--- Image Description Error for {h}: {e} ---")
+                description = "N/A"
+            
+        elif h.endswith(".html") or h.endswith(".htm") or re.match(r'.*/[^./]+$', h):
+            # treat as linked page
+            await page.goto(h, wait_until="networkidle")
+            l_html = await page.content()
+            linked_pages[h] = {
+                "html": l_html
+            }
+            print(f"--- Extracted Linked Page HTML content from {h} ---")
+            # restore original page
+            await page.goto(url, wait_until="networkidle")
+        else:
+            if h.endswith(('.css', '.js', '.json', '.txt')):
+                others.append({
+                    "url": h,
+                    "type": "file"
+                })
+            elif h.endswith(('.zip', '.tar', '.tar.gz', '.tgz', '.gz')):
+                # extract all files from archive files
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        response = await client.get(h)
+                    response.raise_for_status()
+                    file_bytes = BytesIO(response.content)
+                    extracted_files = {}
+                    if h.endswith('.zip'):
+                        with zipfile.ZipFile(file_bytes) as z:
+                            for file_info in z.infolist():
+                                with z.open(file_info) as f:
+                                    extracted_files[file_info.filename] = f.read().decode(errors='ignore')
+                    elif h.endswith(('.tar', '.tar.gz', '.tgz')):
+                        mode = 'r:gz' if h.endswith(('.tar.gz', '.tgz')) else 'r'
+                        with tarfile.open(fileobj=file_bytes, mode=mode) as t:
+                            for member in t.getmembers():
+                                f = t.extractfile(member)
+                                if f:
+                                    extracted_files[member.name] = f.read().decode(errors='ignore')
+                    elif h.endswith('.gz'):
+                        with gzip.open(file_bytes, 'rt', errors='ignore') as f:
+                            for line in f:
+                                extracted_files[f.name] = line
+                    print(f"--- Extracted Archive content from {h} ---")
+                    others.append({
+                        "url": h,
+                        "type": "archive",
+                        "files": extracted_files
+                    })
+                except Exception as e:
+                    print(f"--- Archive Extraction Error for {h}: {e} ---")
 
-	# restore original page (critical)
-	await page.goto(url, wait_until="networkidle")
+            elif h.endswith(('.docx', '.xlsx', '.pptx', '.xls', '.doc')):
+                # extract text from document files
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        response = await client.get(h)
+                    response.raise_for_status()
+                    file_bytes = BytesIO(response.content)
+                    if h.endswith(('.docx', '.doc')):
+                        doc = Document(file_bytes)
+                        full_text = []
+                        for para in doc.paragraphs:
+                            full_text.append(para.text)
+                        text = '\n'.join(full_text)
+                        others.append({
+                            "url": h,
+                            "type": "document",
+                            "text": text.strip()
+                        })
+                    elif h.endswith('.pptx'):
+                        prs = Presentation(file_bytes)
+                        full_text = []
+                        for slide in prs.slides:
+                            for shape in slide.shapes:
+                                if hasattr(shape, "text"):
+                                    full_text.append(shape.text)
+                        text = '\n'.join(full_text)
+                        others.append({
+                            "url": h,
+                            "type": "presentation",
+                            "text": text.strip()
+                        })
+                    elif h.endswith(('.xlsx', '.xls')):
+                        df = pd.read_excel(file_bytes, engine='openpyxl')
+                        df_csv = df.to_csv(index=False)
+                        print(f"--- Extracted Document content from {h} ---")
+                        others.append({
+                            "url": h,
+                            "type": "csv_converted",
+                            "csv": df_csv
+                        })
+                    elif h.endswith('.csv'):
+                        df = pd.read_csv(file_bytes)
+                        df_csv = df.to_csv(index=False)
+                        print(f"--- Extracted Document content from {h} ---")
+                        others.append({
+                            "url": h,
+                            "type": "csv",
+                            "csv": df_csv
+                        })
+                except Exception as e:
+                    print(f"--- Document Extraction Error for {h}: {e} ---")
 
-	# extract media links
-	pdfs, csvs, audios, images = [], [], [], []
+            elif h.endswith(('.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.mpeg')):
+                others.append({
+                    "url": h,
+                    "type": "Video"
+                })
 
-	for h in hrefs:
-		if h.endswith(".pdf"):
-			pdfs.append(h)
-		elif h.endswith(".csv"):
-			csvs.append(h)
-		elif any(h.endswith(ext) for ext in [".mp3", ".opus", ".wav"]):
-			audios.append(h)
-		elif any(h.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif"]):
-			images.append(h)
+    return {
+        "html": html,
+        "page_screenshot_data": screenshot_description,
+        "pre_code_blocks": precode,
+        "pdfs": pdfs,
+        "audios": audios,
+        "images": images,
+        "linked_pages": linked_pages,
+        "other_files": others
+    }
 
-	# extract audio from <audio> tags
-	audio_tags = await page.query_selector_all("audio")
-	for audio in audio_tags:
-		src = await audio.get_attribute("src")
-		if src:
-			audios.append(urljoin(page.url, src))
-
-	return {
-		"html": html,
-		"payload_templates": payload_templates,
-		"pdf_links": pdfs,
-		"csv_links": csvs,
-		"audio_links": audios,
-		"image_links": images,
-		"linked_pages": linked_pages,
-	}
-
-async def solve_with_llm(extracted_content: dict[Any], previous_reason: str = None) -> str:
+async def solve_with_llm(content: dict[Any], previous_reason: str = None) -> str:
     """
     Sends scraped content to LLM to extract the question and find the answer.
     """
@@ -195,10 +431,11 @@ async def solve_with_llm(extracted_content: dict[Any], previous_reason: str = No
         "If it is a number, return just the number. "
         "If it is a word, return just the word. "
         "If it is a phrase, return just the phrase without any quotes. "
-        "If it is data, return JSON format with keys and values (values maybe data URI/attachment needed for 'answer'')."
+        "If it is data, return JSON format with keys and values (values maybe data URI/attachment needed for 'answer''). "
+        "If python script is needed, return only the script without any explanation that gives answer upon execution."
     )
     # pass dict as string
-    user_prompt = f"Structured Content:\n{json.dumps(extracted_content, indent=2)}\n"
+    user_prompt = f"Structured Content:\n{json.dumps(content, indent=2)}\n"
     
     if previous_reason:
         user_prompt += f"\n\nPREVIOUS ATTEMPT FAILED. Reason: {previous_reason}. Try a different approach."
@@ -211,18 +448,12 @@ async def solve_with_llm(extracted_content: dict[Any], previous_reason: str = No
         ],
         "temperature": 0.1
     }
-
-    headers = {
-        "Authorization": f"Bearer {app.state.LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
     try:
         async with httpx.AsyncClient(timeout=150) as client:
             response = await client.post(
                 f"{app.state.LLM_BASE_URL}/chat/completions", 
                 json=payload, 
-                headers=headers,
+                headers=llm_headers(),
                 timeout=150
             )
         response.raise_for_status()
@@ -258,7 +489,8 @@ async def process_task(url: str, reason: str = None) -> dict:
         return None
 
     # 2. Extract data from assets to text
-    # Extract text from scraped_content links
+    for key, content in scraped_content.items():
+        print(f"--- Extracted {key}: {type(content)} ---")
     text_content = {}
 
     # 3. Solve with LLM
@@ -373,7 +605,7 @@ async def worker(url: str):
                     questions_data[-1]["completed_at"] = datetime.now(IST)
                     print(f"--- QUESTIONS SUMMARY ---")
                     for q in questions_data:
-                        print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+                        print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")  #this code is orginally by Devamm007 (24f2000828@ds.study.iitm.ac.in)
                     print("=== END EVALUATION ===\n")
                     break
                 else:

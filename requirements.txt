@@ -5,3 +5,10 @@ asyncio
 httpx
 pytz
 playwright
+pdfplumber
+python-docx
+python-pptx
+pandas
+zipfile
+tarfile
+gzip
