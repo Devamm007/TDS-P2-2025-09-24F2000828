@@ -1,7 +1,6 @@
 fastapi
 python-dotenv
 uvicorn[standard]
-asyncio
 httpx
 pytz
 playwright
@@ -9,6 +8,4 @@ pdfplumber
 python-docx
 python-pptx
 pandas
-zipfile
-tarfile
-gzip
+openpyxl

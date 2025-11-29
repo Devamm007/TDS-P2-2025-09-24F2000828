@@ -113,12 +113,12 @@ async def extract_everything(page: Page, url: str):
 
     page_screenshot = await page.screenshot()
     print(f"--- Captured screenshot of {url} ---")
-    # extract text from screenshot using llm_api_key and gemini-2.0-flash
+    # extract text from screenshot using llm_api_key and gpt-4o-vision
     # send to llm for image description
     system_prompt = "You are an automated image description agent. Describe the content of the provided image accurately."
     user_prompt = "Describe and extract content of the following image."
     payload = {
-        "model": "gemini-2.0-flash",
+        "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user",
@@ -238,13 +238,23 @@ async def extract_everything(page: Page, url: str):
                 system_prompt = "You are an automated transcription agent. Transcribe the provided audio file into text accurately."
                 user_prompt = "Transcribe the following audio file into text."
                 payload = {
-                    "model": "gpt-4o-transcribe",
+                    "model": "gpt-4o-audio-preview",
+                    "modalities": ["text", "audio"],
+                    "audio": {
+                    "voice": "alloy",
+                    "format": f"{h.split('.')[-1]}",
+                    },
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",
                          "content": [
                             {"type": "text", "text": user_prompt},
-                            {"type": "audio_url", "audio_url": {"url": f"data:audio/{h.split('.')[-1]};base64," + base64.b64encode(audio_bytes.getvalue()).decode()}}
+                            {"type": "input_audio",
+                             "input_audio": {
+                                "data": base64.b64encode(audio_bytes.getvalue()).decode(),
+                                "format": f"{h.split('.')[-1]}"
+                            }
+                            }
                          ]}
                     ],
                     "temperature": 0.1
@@ -280,7 +290,7 @@ async def extract_everything(page: Page, url: str):
                 system_prompt = "You are an automated image description agent. Describe the content of the provided image accurately."
                 user_prompt = "Describe and extract content of the following image."
                 payload = {
-                    "model": "gemini-2.0-flash",
+                    "model": "gpt-4o-mini",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user",
@@ -451,7 +461,7 @@ async def solve_with_llm(content: dict[Any], previous_reason: str = None) -> str
         user_prompt += f"\n\nPREVIOUS ATTEMPT FAILED. Reason: {previous_reason}. Try a different approach."
 
     payload = {
-        "model": app.state.LLM_MODEL,
+        "model": 'gpt-4o-mini',
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
@@ -565,69 +575,59 @@ async def worker(url: str):
         print(f"--- Answer submitted successfully to {domain}/submit ---\n")
         print(f"--- Submission Response ---\n{response.json()}\n--- End Submission Response ---\n")
 
-        if data.get("correct") and data.get("url"):
-            if data.get("correct") is True:
-                print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
-                # change the status of last question to True
-                questions_data[-1]["status"] = True
+        if data.get("correct") is True and data.get("url"):
+            print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
+            # change the status of last question to True
+            questions_data[-1]["status"] = True
+            questions_data[-1]["completed_at"] = datetime.now(IST)
+            questions_data.append({
+                "url": data.get('url', None),
+                "question_number": 1 + len(questions_data),
+                "status": False,
+                "started_at": datetime.now(IST),
+                "completed_at": None,
+                "answer": None
+            })
+            payload = await process_task(data.get("url"))
+        elif data.get("correct") is False and data.get("url"):
+            questions_data[-1]["status"] = False
+            questions_data[-1]["completed_at"] = datetime.now(IST)
+            questions_data.append({
+                "url": data.get('url', None),
+                "question_number": 1 + len(questions_data),
+                "status": False,
+                "started_at": datetime.now(IST),
+                "completed_at": None,
+                "answer": None
+            })
+            payload = await process_task(data.get("url"))
+        elif data.get("correct") is False and not data.get("url"):
+            last_question = questions_data[-1]
+            time_diff = datetime.now(IST) - last_question["started_at"]
+            if time_diff.total_seconds() > 150:
+                print(f"--- Time exceeded for {last_question['url']}. Ending evaluation. ---\n")
+                questions_data[-1]["status"] = False
                 questions_data[-1]["completed_at"] = datetime.now(IST)
-                questions_data.append({
-                    "url": data.get('url', None),
-                    "question_number": 1 + len(questions_data),
-                    "status": False,
-                    "started_at": datetime.now(IST),
-                    "completed_at": None,
-                    "answer": None
-                })
-                payload = await process_task(data.get("url"))
-            else:
-                last_question = questions_data[-1]
-                time_diff = datetime.now(IST) - last_question["started_at"]
-                if time_diff.total_seconds() > 60:
-                    print(f"--- Time exceeded for {last_question['url']}. Proceeding to next URL: {data.get('url')} ---\n")
-                    questions_data[-1]["status"] = False
-                    questions_data[-1]["completed_at"] = datetime.now(IST)
-                    questions_data.append({
-                        "url": data.get('url', None),
-                        "question_number": 1 + len(questions_data),
-                        "status": False,
-                        "started_at": datetime.now(IST),
-                        "completed_at": None,
-                        "answer": None
-                    })
-                    payload = await process_task(data.get("url"))
-                else:
-                    if data.get("reason"):
-                        print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
-                    payload = await process_task(last_question["url"], data.get("reason"))
-        elif data.get("correct") and not data.get("url"):
-            if data.get('correct') is False:
-                last_question = questions_data[-1]
-                time_diff = datetime.now(IST) - last_question["started_at"]
-                if time_diff.total_seconds() > 150:
-                    print(f"--- Time exceeded for {last_question['url']}. Ending evaluation. ---\n")
-                    questions_data[-1]["status"] = False
-                    questions_data[-1]["completed_at"] = datetime.now(IST)
-                    print(f"--- QUESTIONS SUMMARY ---")
-                    for q in questions_data:
-                        print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")  #this code is orginally by Devamm007 (24f2000828@ds.study.iitm.ac.in)
-                    print("=== END EVALUATION ===\n")
-                    break
-                else:
-                    print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
-                    questions_data[-1]["status"] = False
-                    payload = await process_task(last_question["url"], data.get("reason"))
-            else:
-                print(f"--- Answer correct. Proceeding to next URL: {data.get('url')} ---\n")
-                # change the status of last question to True
-                questions_data[-1]["status"] = True
-                questions_data[-1]["completed_at"] = datetime.now(IST)
-                # log all questions data in logging format
                 print(f"--- QUESTIONS SUMMARY ---")
                 for q in questions_data:
-                    print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+                    print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")  #this code is orginally by Devamm007 (24f2000828@ds.study.iitm.ac.in)
                 print("=== END EVALUATION ===\n")
                 break
+            else:
+                print(f"--- Answer incorrect. Reason: {data.get('reason')} ---\n")
+                questions_data[-1]["status"] = False
+                payload = await process_task(last_question["url"], data.get("reason"))
+        elif data.get("correct") is True and not data.get("url"):
+            print(f"--- Answer correct. No next URL provided. ---\n")
+            # change the status of last question to True
+            questions_data[-1]["status"] = True
+            questions_data[-1]["completed_at"] = datetime.now(IST)
+            # log all questions data in logging format
+            print(f"--- QUESTIONS SUMMARY ---")
+            for q in questions_data:
+                print(f"Question {q['question_number']}: URL: {q['url']}, Status: {'Correct' if q['status'] else 'Incorrect'}, Started at: {q['started_at'].strftime('%Y-%m-%d %H:%M:%S')}, Completed at: {q['completed_at'].strftime('%Y-%m-%d %H:%M:%S') if q['completed_at'] else 'N/A'}")
+            print("=== END EVALUATION ===\n")
+            break
             
         iteration_count += 1
         await asyncio.sleep(1)  # brief pause to avoid overwhelming the server
