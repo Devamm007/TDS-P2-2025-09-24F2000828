@@ -3,3 +3,4 @@ render.html
 .env
 .venv/
 test_requests.txt
+__pycache__/
