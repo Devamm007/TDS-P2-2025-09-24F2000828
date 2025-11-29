@@ -4,3 +4,4 @@ render.html
 .venv/
 test_requests.txt
 __pycache__/
+*.pyc
